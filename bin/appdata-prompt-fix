@@ -1,0 +1,402 @@
+#!/usr/bin/env bash
+#
+# appdata-prompt-fix — stop the repeated macOS prompt
+#   "<App> would like to access data from other apps."
+#
+# macOS 15+ enforces TCC service kTCCServiceSystemPolicyAppData. TCC stores an
+# authorization record tied to the accessing app's *code requirement*. When an
+# app is re-signed, patched, or shipped with a broken code seal, that stored
+# requirement no longer matches the running code, so TCC can neither remember a
+# grant nor honour an existing one: every launch asks again.
+#
+# This tool diagnoses that situation, rebuilds the TCC records, and — because
+# Full Disk Access supersedes the App Data gate — adds the app to Full Disk
+# Access so the prompt stops for good.
+#
+# Usage: appdata-prompt-fix <command> [options]
+# Run `appdata-prompt-fix help` for the command list.
+#
+# Supported: macOS 15+ (Sequoia, Tahoe). Linux/Windows intentionally unsupported.
+#
+set -uo pipefail
+
+readonly PROG="${0##*/}"
+readonly BACKUP_ROOT="$HOME/Library/Application Support/appdata-prompt-fix/backups"
+readonly TCC_SERVICES=(SystemPolicyAppData SystemPolicyAppBundles SystemPolicyAllFiles ScreenCapture)
+
+if [ -t 1 ] && command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
+  BOLD=$(tput bold); DIM=$(tput dim); RED=$(tput setaf 1); GRN=$(tput setaf 2)
+  YEL=$(tput setaf 3); BLU=$(tput setaf 4); RST=$(tput sgr0)
+else
+  BOLD=''; DIM=''; RED=''; GRN=''; YEL=''; BLU=''; RST=''
+fi
+
+say()  { printf '%s\n' "$*"; }
+head1() { printf '\n%s%s%s\n' "$BOLD$BLU" "$*" "$RST"; }
+ok()   { printf '  %s✓%s %s\n' "$GRN" "$RST" "$*"; }
+warn() { printf '  %s!%s %s\n' "$YEL" "$RST" "$*"; }
+bad()  { printf '  %s✗%s %s\n' "$RED" "$RST" "$*"; }
+die()  { printf '%serror:%s %s\n' "$RED" "$RST" "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+appdata-prompt-fix — fix the repeated "would like to access data from other apps" prompt
+
+USAGE
+  appdata-prompt-fix diagnose <app-path|bundle-id>
+  appdata-prompt-fix reset    <bundle-id> [--all]
+  appdata-prompt-fix reseal   <app-path> [--deep]
+  appdata-prompt-fix fda      <app-path> [--manual]
+  appdata-prompt-fix verify   <bundle-id> [minutes]
+  appdata-prompt-fix help
+
+COMMANDS
+  diagnose   Show the app's code identity, seal integrity and the recent TCC
+             decisions from the unified log. Start here.
+  reset      Delete stale TCC records for the app (App Data, App Management,
+             Full Disk Access, Screen Capture).
+  reseal     Repair a broken code seal by re-signing the bundle in place
+             (backup first). Needed when `codesign --verify` reports
+             "a sealed resource is missing or invalid".
+  fda        Open System Settings ▸ Privacy & Security ▸ Full Disk Access and add
+             the app automatically (falls back to manual instructions).
+  verify     Count App Data prompts for the app over the last N minutes
+             (default 5) and report PASS/FAIL.
+
+WHY THIS WORKS
+  macOS keys every TCC decision to the accessing app's code requirement. A
+  patched or re-signed app no longer satisfies the requirement stored in TCC, so
+  "Allow" is recorded but never matches again — the prompt returns on every
+  launch. Full Disk Access is a stronger grant that bypasses the App Data gate,
+  and a freshly created Full Disk Access record is bound to the app's *current*
+  requirement, so it keeps matching.
+
+NOTES
+  * Reset/reseal need no root; reseal needs write access to the bundle
+    (re-run with sudo for apps in /Applications owned by root).
+  * fda requires Accessibility permission for your terminal app.
+  * Nothing here is specific to any vendor; it works for any app that triggers
+    the App Data prompt.
+EOF
+}
+
+# ---------- helpers ---------------------------------------------------------
+
+require_macos() {
+  [ "$(uname -s)" = "Darwin" ] || die "macOS only"
+}
+
+resolve_app() {
+  local arg=$1
+  if [ -d "$arg" ] && [[ $arg == *.app ]]; then
+    (cd "$arg" && pwd -P)
+    return
+  fi
+  local hit
+  hit=$(mdfind "kMDItemCFBundleIdentifier == \"$arg\"" 2>/dev/null | grep -m1 '\.app$')
+  [ -n "${hit:-}" ] || die "cannot find an app bundle for '$arg'"
+  printf '%s\n' "$hit"
+}
+
+bundle_id() {
+  /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$1/Contents/Info.plist" 2>/dev/null
+}
+
+cdhash() {
+  codesign -d -r- "$1" 2>/dev/null | sed -n 's/.*cdhash H"\([^"]*\)".*/\1/p' | head -1
+}
+
+designated_req() {
+  codesign -d -r- "$1" 2>&1 | sed -n '/=>/p' | tail -1 | sed 's/^# *//'
+}
+
+seal_state() {
+  local out
+  out=$(codesign --verify --verbose=1 "$1" 2>&1)
+  if printf '%s' "$out" | grep -q "valid on disk"; then
+    printf 'ok'
+  elif printf '%s' "$out" | grep -qi "sealed resource is missing or invalid"; then
+    printf 'broken seal'
+  elif printf '%s' "$out" | grep -qi "not signed at all"; then
+    printf 'unsigned'
+  else
+    printf 'unverified'
+  fi
+}
+
+log_tcc() {
+  # $1 = bundle id, $2 = minutes
+  local id=$1 mins=${2:-5}
+  log show --last "${mins}m" --style compact \
+    --predicate "process == \"tccd\" AND eventMessage CONTAINS \"$id\"" 2>/dev/null
+}
+
+# ---------- commands --------------------------------------------------------
+
+cmd_diagnose() {
+  local target=${1:?usage: diagnose <app-path|bundle-id>}
+  local app id seal
+  app=$(resolve_app "$target")
+  id=$(bundle_id "$app")
+  [ -n "$id" ] || die "no CFBundleIdentifier in $app"
+
+  head1 "App"
+  say "  path        $app"
+  say "  bundle id   $id"
+
+  head1 "Code identity"
+  local cd dr
+  cd=$(cdhash "$app"); dr=$(designated_req "$app"); seal=$(seal_state "$app")
+  say "  cdhash      ${cd:-<none>}"
+  say "  requirement ${dr:-<none>}"
+  case $seal in
+    ok)          ok "code signature valid on disk" ;;
+    'broken seal') bad "sealed resource is missing or invalid — the bundle was modified after signing" ;;
+    unsigned)    warn "bundle is not signed" ;;
+    *)           warn "signature state unclear" ;;
+  esac
+  if codesign -dvv "$app" 2>&1 | grep -q "flags=.*adhoc"; then
+    warn "ad-hoc signature: the stored requirement is cdhash-based, so any later modification invalidates grants"
+  fi
+
+  head1 "Recent TCC decisions (last 5 minutes)"
+  local logs
+  logs=$(log_tcc "$id" 5)
+  if [ -z "$logs" ]; then
+    warn "no tccd activity for $id — launch the app and re-run diagnose"
+  else
+    local prompts mismatch
+    prompts=$(printf '%s\n' "$logs" | grep -c "AUTHREQ_PROMPTING")
+    mismatch=$(printf '%s\n' "$logs" | grep -c "Failed to match existing code requirement")
+    [ "$prompts" -gt 0 ] && bad "prompted $prompts time(s)" || ok "no prompt raised"
+    if [ "$mismatch" -gt 0 ]; then
+      bad "stored requirement failed to match $mismatch time(s):"
+      printf '%s\n' "$logs" | grep -A2 "Failed to match existing code requirement" | sed 's/^/      /' | head -8
+    fi
+    printf '%s\n' "$logs" | grep -E "AUTHREQ_PROMPTING|AUTHREQ_RESULT" | tail -4 | sed 's/^/      /'
+  fi
+
+  head1 "Verdict"
+  if [ "$seal" = "broken seal" ]; then
+    say "  Seal broken → TCC cannot key records to this app. Run:"
+    say "    ${PROG} reseal \"$app\"     (then: ${PROG} fda \"$app\")"
+  elif [ "${mismatch:-0}" -gt 0 ] || [ "${prompts:-0}" -gt 0 ]; then
+    say "  Grants are not sticking. Rebuild the records:"
+    say "    ${PROG} reset \"$id\" && ${PROG} fda \"$app\""
+  else
+    say "  No repeated prompt detected right now. If it returns, run reset + fda."
+  fi
+  say ""
+}
+
+cmd_reset() {
+  local id=${1:?usage: reset <bundle-id> [--all]}
+  local all=0
+  [ "${2:-}" = "--all" ] && all=1
+  head1 "Resetting TCC records for $id"
+  local svc
+  for svc in "${TCC_SERVICES[@]}"; do
+    if [ "$all" = 0 ] && [ "$svc" = "ScreenCapture" ]; then continue; fi
+    tccutil reset "$svc" "$id" >/dev/null 2>&1 && ok "$svc" || warn "$svc (no record or reset refused)"
+  done
+  say ""
+  say "Next: re-grant with Full Disk Access so the new record matches current code:"
+  say "  ${PROG} fda \"<app-path>\""
+  say ""
+}
+
+cmd_reseal() {
+  local target=${1:?usage: reseal <app-path> [--deep]}
+  local deep=${2:-}
+  local app id stamp backup
+  app=$(resolve_app "$target")
+  id=$(bundle_id "$app")
+
+  [ -w "$app/Contents" ] || die "no write access to $app — re-run with sudo"
+
+  head1 "Backing up"
+  stamp=$(date +%Y%m%d-%H%M%S)
+  backup="$BACKUP_ROOT/$id-$stamp"
+  mkdir -p "$backup"
+  cp -R "$app/Contents/_CodeSignature" "$backup/_CodeSignature" 2>/dev/null || warn "no _CodeSignature to back up"
+  local mainbin
+  mainbin=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist" 2>/dev/null)
+  if [ -n "${mainbin:-}" ] && [ -f "$app/Contents/MacOS/$mainbin" ]; then
+    cp -p "$app/Contents/MacOS/$mainbin" "$backup/$mainbin" 2>/dev/null || warn "main executable not backed up"
+  fi
+  # keep backups reachable for the logged-in user even when run via sudo
+  if [ "$(id -u)" -eq 0 ]; then chown -R "$(stat -f%Su "$HOME")" "$backup" 2>/dev/null || true; fi
+  ok "backup: $backup"
+
+  head1 "Before"
+  say "  cdhash      $(cdhash "$app")"
+  say "  requirement $(designated_req "$app")"
+
+  head1 "Re-signing (ad-hoc, entitlements preserved)"
+  local args=(--force --sign - --preserve-metadata=entitlements,flags,runtime)
+  [ "$deep" = "--deep" ] && args=(--force --deep --sign - --preserve-metadata=entitlements,flags,runtime)
+  if ! codesign "${args[@]}" "$app" 2>&1 | sed 's/^/  /'; then
+    bad "codesign failed — restoring _CodeSignature"
+    [ -d "$backup/_CodeSignature" ] && cp -R "$backup/_CodeSignature" "$app/Contents/_CodeSignature"
+    exit 1
+  fi
+  ok "re-signed"
+
+  head1 "After"
+  say "  cdhash      $(cdhash "$app")"
+  say "  seal        $(seal_state "$app")"
+  say ""
+  say "Next steps (one Touch ID each):"
+  say "  1. ${PROG} reset \"$id\""
+  say "  2. ${PROG} fda \"$app\""
+  say "  3. relaunch the app, then: ${PROG} verify \"$id\""
+  say ""
+  say "Rollback: cp -R \"$backup/_CodeSignature\" \"$app/Contents/_CodeSignature\""
+  say ""
+}
+
+cmd_fda() {
+  local target=${1:?usage: fda <app-path> [--manual]}
+  local mode=${2:-}
+  local app
+  app=$(resolve_app "$target")
+
+  if [ "$mode" = "--manual" ] || ! command -v osascript >/dev/null 2>&1; then
+    fda_manual "$app"; return
+  fi
+
+  head1 "Adding to Full Disk Access"
+  say "  target: $app"
+
+  local jxa
+  jxa=$(mktemp "${TMPDIR:-/tmp}/appdata-fda.XXXXXX").jxa
+  cat > "$jxa" <<'JXA'
+ObjC.import('AppKit');
+const appPath = $.NSProcessInfo.processInfo.environment.objectForKey('APP_PATH').js;
+const se = Application('System Events');
+const out = [];
+function activate(p) {
+  for (let i = 0; i < 12; i++) {
+    try { p.frontmost = true; } catch (e) {}
+    delay(0.3);
+    try { if (p.frontmost()) return true; } catch (e) {}
+  }
+  return false;
+}
+const p = se.processes['System Settings'];
+if (!activate(p)) { out.push('ERR system settings not reachable'); out.join('\n'); } else {
+  const w = p.windows[0];
+  try { w.position = [80, 80]; w.size = [980, 700]; } catch (e) {}
+  let plus = null;
+  function findPlus(el, depth) {
+    if (depth > 12 || plus) return;
+    let role = ''; try { role = el.role(); } catch (e) { return; }
+    if (role === 'AXButton') {
+      let d = '', sz = [];
+      try { d = el.description() || ''; } catch (e) {}
+      try { sz = el.size() || []; } catch (e) {}
+      if (d === 'button' && sz[0] >= 8 && sz[1] >= 8) { plus = el; return; }
+    }
+    let kids = []; try { kids = el.uiElements(); } catch (e) { return; }
+    kids.forEach(k => findPlus(k, depth + 1));
+  }
+  findPlus(w, 0);
+  if (!plus) { out.push('ERR add button not found (Accessibility permission?)'); out.join('\n'); } else {
+    try { plus.actions.byName('AXPress').perform(); } catch (e) { out.push('ERR press: ' + e.message); }
+    delay(3);
+    let panel = null;
+    try { p.windows().forEach(x => { let n = ''; try { n = x.name() || ''; } catch (e) {} if (n === 'Open') panel = x; }); } catch (e) {}
+    if (!panel) { out.push('ERR file panel did not open'); out.join('\n'); } else {
+      $.NSPasteboard.generalPasteboard.clearContents;
+      $.NSPasteboard.generalPasteboard.setStringForType($(appPath), $.NSPasteboardTypeString);
+      activate(p);
+      se.keystroke('g', { using: ['command down', 'shift down'] });
+      delay(1.5);
+      se.keystroke('a', { using: ['command down'] });
+      delay(0.3);
+      se.keystroke('v', { using: ['command down'] });
+      delay(1.2);
+      se.keyCode(36); delay(2.5);
+      se.keyCode(36); delay(3);
+      out.push('OK');
+      out.join('\n');
+    }
+  }
+}
+JXA
+
+  APP_PATH="$app" osascript -l JavaScript "$jxa" 2>&1 | sed 's/^/  /'
+  local rc=${PIPESTATUS[0]}
+  rm -f "$jxa"
+
+  if [ "$rc" -ne 0 ]; then
+    warn "automatic add failed"
+    fda_manual "$app"
+    return
+  fi
+
+  # System Settings asks for Touch ID/password; nothing to script past that point.
+  say ""
+  say "  If a Touch ID / password sheet is waiting, confirm it — the record is"
+  say "  written with the app's current code requirement."
+  say "  Verify with: ${PROG} verify \"$(bundle_id "$app")\""
+  say ""
+}
+
+fda_manual() {
+  local app=$1
+  head1 "Manual steps (30 seconds, one Touch ID)"
+  say "  1. Open System Settings ▸ Privacy & Security ▸ Full Disk Access"
+  say "  2. Select the app's existing entry (if present) and press “−” to remove it"
+  say "  3. Press “+” and add:"
+  say "       $app"
+  say "     (in the file panel press ⇧⌘G and paste the path)"
+  say "  4. Quit and relaunch the app"
+  say ""
+  say "  Deep link:"
+  say "    open 'x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles'"
+  say ""
+}
+
+cmd_verify() {
+  local id=${1:?usage: verify <bundle-id> [minutes]}
+  local mins=${2:-5}
+  head1 "Verifying $id (last ${mins}m)"
+  local logs prompts
+  logs=$(log_tcc "$id" "$mins")
+  prompts=$(printf '%s\n' "$logs" | grep -c "AUTHREQ_PROMPTING")
+  if [ "${prompts:-0}" -eq 0 ]; then
+    ok "no App Data prompt raised for $id"
+    say ""
+    say "  PASS — nothing is asking for permission any more."
+  else
+    bad "prompted $prompts time(s) in the last ${mins}m"
+    printf '%s\n' "$logs" | grep "AUTHREQ_PROMPTING" | tail -3 | sed 's/^/      /'
+    say ""
+    say "  Note: this window includes any prompt raised before your fix was applied."
+    say "  Relaunch the app, then re-run with a short window, e.g. ${PROG} verify \"$id\" 3"
+    say ""
+    say "  If it still prompts after the fix: ${PROG} reset \"$id\" && ${PROG} fda \"<app-path>\""
+    exit 1
+  fi
+  say ""
+}
+
+# ---------- dispatch --------------------------------------------------------
+
+main() {
+  require_macos
+  local cmd=${1:-help}
+  shift || true
+  case $cmd in
+    diagnose) cmd_diagnose "$@" ;;
+    reset)    cmd_reset "$@" ;;
+    reseal)   cmd_reseal "$@" ;;
+    fda)      cmd_fda "$@" ;;
+    verify)   cmd_verify "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
