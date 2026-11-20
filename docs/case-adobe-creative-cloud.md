@@ -1,6 +1,6 @@
 # 案例：Adobe Illustrator 2025 / Photoshop 2025 每次启动都弹窗
 
-环境：macOS 26.5.2（Tahoe），Apple Silicon，Adobe Illustrator 29.3.0、Photoshop 2025（用激活工具安装的版本）。
+环境：macOS 26.5.2（Tahoe），Apple Silicon，Adobe Illustrator 29.3.0、Photoshop 2025。
 
 ## 现象
 
